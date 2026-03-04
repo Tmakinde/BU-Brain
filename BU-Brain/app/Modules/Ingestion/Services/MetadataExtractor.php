@@ -59,11 +59,6 @@ class MetadataExtractor
             return $match[1];
         }
 
-        // Try Python def
-        if (preg_match('/def\s+(\w+)/', $code, $match)) {
-            return $match[1];
-        }
-
         return null;
     }
 
