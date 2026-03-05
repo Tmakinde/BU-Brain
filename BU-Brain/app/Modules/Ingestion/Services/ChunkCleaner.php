@@ -4,91 +4,94 @@ namespace App\Modules\Ingestion\Services;
 
 class ChunkCleaner
 {
+    // Safe limit — leave headroom below the model's actual max
+    // nomic-embed-text: 8192 max → we use 512 tokens as practical chunk ceiling
+    // This keeps chunks focused and embeddings precise
+    private const MAX_TOKENS = 512;
+
+    // Approximate chars-per-token for code (code is denser than prose)
+    private const CHARS_PER_TOKEN = 3;
+
+    private const MAX_CHARS = self::MAX_TOKENS * self::CHARS_PER_TOKEN; // ~1536 chars
+
     /**
-     * Clean a code chunk by removing noise while preserving meaningful code.
-     *
-     * @param string $code Raw code chunk
-     * @param string $extension File extension (php, js, ts, py, sql)
-     * @return string Cleaned code
+     * Clean a chunk and ensure it fits within the embedding model's token limit.
+     * Returns one or more cleaned chunks — splits if oversized.
      */
-    public function clean(string $code, string $extension): string
+    public function cleanAndGuard(array $chunk): array
     {
-        return match ($extension) {
-            'php' => $this->cleanPhp($code),
-            'js', 'ts' => $this->cleanJavaScript($code),
-            'sql' => $this->cleanSql($code),
-            default => $this->cleanGeneric($code),
-        };
+        $cleaned = $this->clean($chunk['code']);
+
+        // If within limit, return single cleaned chunk
+        if (strlen($cleaned) <= self::MAX_CHARS) {
+            return [$chunk + ['code' => $cleaned]];
+        }
+
+        // Oversized — split by lines, preserving as much context as possible
+        return $this->splitOversizedChunk($chunk, $cleaned);
     }
 
     /**
-     * Clean PHP code.
+     * Clean code text — strip noise before embedding.
      */
-    private function cleanPhp(string $code): string
+    public function clean(string $code): string
     {
-        // Remove PHPDoc blocks
+        // Strip PHPDoc blocks
         $code = preg_replace('/\/\*\*[\s\S]*?\*\//', '', $code);
 
-        // Remove multi-line comments
-        $code = preg_replace('/\/\*[\s\S]*?\*\//', '', $code);
+        // Strip single-line comments
+        $code = preg_replace('/\/\/[^\n]*/', '', $code);
 
-        // Remove single-line comments (be careful with URLs)
-        $code = preg_replace('/(?<!:)\/\/.*$/m', '', $code);
+        // Strip Python/bash style comments
+        $code = preg_replace('/#[^\n]*/', '', $code);
 
-        // Remove excessive blank lines (keep max 1)
-        $code = preg_replace('/\n{3,}/', "\n\n", $code);
-
-        // Remove leading/trailing whitespace from each line while preserving indentation structure
-        $lines = explode("\n", $code);
-        $lines = array_map('rtrim', $lines);
-        $code = implode("\n", $lines);
-
-        return trim($code);
-    }
-
-    /**
-     * Clean JavaScript/TypeScript code.
-     */
-    private function cleanJavaScript(string $code): string
-    {
-        // Remove JSDoc blocks
-        $code = preg_replace('/\/\*\*[\s\S]*?\*\//', '', $code);
-
-        // Remove multi-line comments
-        $code = preg_replace('/\/\*[\s\S]*?\*\//', '', $code);
-
-        // Remove single-line comments
-        $code = preg_replace('/(?<!:)\/\/.*$/m', '', $code);
-
-        // Remove excessive blank lines
+        // Strip excess blank lines (max 1 consecutive blank line)
         $code = preg_replace('/\n{3,}/', "\n\n", $code);
 
         return trim($code);
     }
 
     /**
-     * Clean SQL code.
+     * Split an oversized chunk into multiple smaller chunks.
+     * Splits at line boundaries to avoid cutting mid-expression.
+     * Preserves method_name and class_name on each sub-chunk.
      */
-    private function cleanSql(string $code): string
+    private function splitOversizedChunk(array $chunk, string $cleanedCode): array
     {
-        // Remove SQL comments
-        $code = preg_replace('/--.*$/m', '', $code);
-        $code = preg_replace('/\/\*[\s\S]*?\*\//', '', $code);
+        $lines    = explode("\n", $cleanedCode);
+        $subChunks = [];
+        $current  = [];
+        $currentLen = 0;
 
-        // Remove excessive blank lines
-        $code = preg_replace('/\n{3,}/', "\n\n", $code);
+        foreach ($lines as $line) {
+            $lineLen = strlen($line) + 1; // +1 for newline
 
-        return trim($code);
+            if ($currentLen + $lineLen > self::MAX_CHARS && !empty($current)) {
+                // Save current sub-chunk
+                $subChunks[] = $this->buildSubChunk($chunk, implode("\n", $current));
+                $current     = [];
+                $currentLen  = 0;
+            }
+
+            $current[]   = $line;
+            $currentLen += $lineLen;
+        }
+
+        // Catch remaining lines
+        if (!empty($current)) {
+            $subChunks[] = $this->buildSubChunk($chunk, implode("\n", $current));
+        }
+
+        return $subChunks;
     }
 
     /**
-     * Generic cleaning for unknown file types.
+     * Build a sub-chunk preserving all original metadata.
      */
-    private function cleanGeneric(string $code): string
+    private function buildSubChunk(array $originalChunk, string $code): array
     {
-        // Just remove excessive blank lines
-        $code = preg_replace('/\n{3,}/', "\n\n", $code);
-
-        return trim($code);
+        return array_merge($originalChunk, [
+            'code' => trim($code),
+        ]);
     }
 }
