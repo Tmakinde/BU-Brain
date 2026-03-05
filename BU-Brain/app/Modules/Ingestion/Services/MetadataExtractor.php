@@ -2,41 +2,147 @@
 
 namespace App\Modules\Ingestion\Services;
 
+use PhpParser\NodeTraverser;
+use PhpParser\ParserFactory;
+use PhpParser\Error as PhpParserError;
+use App\Modules\Ingestion\Visitors\TableReferenceVisitor;
+use PhpParser\PhpVersion;
+
+/**
+ * Extracts metadata from a code chunk.
+ *
+ * The chunker already provides class_name, method_name, and code_type.
+ * This class fills any gaps via inference and extracts tables_referenced
+ * using PHP-Parser AST traversal — the real work this class exists to do.
+ *
+ * PHP files: parsed via PHP-Parser for accurate table extraction.
+ * Non-PHP files (SQL): fallback regex on raw SQL strings.
+ */
 class MetadataExtractor
 {
+    private \PhpParser\Parser $parser;
+
+    public function __construct()
+    {
+        $this->parser = (new ParserFactory())->createForVersion(PhpVersion::fromString('8.1'));
+    }
+
     /**
      * Extract metadata from a code chunk.
      *
-     * @param string $code The cleaned code
-     * @param string $filePath The file path
-     * @param array $chunkMeta Metadata from chunker (class_name, method_name, code_type)
-     * @return array Complete metadata for the chunk
+     * @param string $code      The cleaned code
+     * @param string $filePath  The file path
+     * @param array  $chunkMeta Metadata already provided by CodeChunker
+     * @return array Complete metadata ready for storage
      */
     public function extract(string $code, string $filePath, array $chunkMeta): array
     {
         return [
-            'file_path' => $filePath,
-            'class_name' => $chunkMeta['class_name'] ?? $this->inferClassName($code, $filePath),
-            'method_name' => $chunkMeta['method_name'] ?? $this->inferMethodName($code),
-            'code_type' => $chunkMeta['code_type'] ?? $this->inferCodeType($filePath),
-            'tables_referenced' => $this->extractTableReferences($code),
+            'file_path'         => $filePath,
+            'class_name'        => $chunkMeta['class_name']  ?? $this->inferClassName($code, $filePath),
+            'method_name'       => $chunkMeta['method_name'] ?? $this->inferMethodName($code),
+            'code_type'         => $chunkMeta['code_type']   ?? $this->inferCodeType($filePath),
+            'tables_referenced' => $this->extractTableReferences($code, $filePath),
         ];
     }
 
+    // =========================================================================
+    // Table reference extraction
+    // =========================================================================
+
     /**
-     * Infer class name from code if not already provided.
+     * Extract all database table references from a code chunk.
+     *
+     * PHP files: parsed into an AST, TableReferenceVisitor walks the tree.
+     * SQL files: regex on raw SQL strings (no PHP to parse).
      */
+    private function extractTableReferences(string $code, string $filePath): array
+    {
+        $extension = pathinfo($filePath, PATHINFO_EXTENSION);
+
+        // SQL files — no PHP to parse, scan the raw SQL string directly
+        if ($extension === 'sql') {
+            return $this->extractTablesFromRawSql($code);
+        }
+
+        // PHP files — parse into AST and walk with visitor
+        if (in_array($extension, ['php'])) {
+            return $this->extractTablesFromPhp($code, $filePath);
+        }
+
+        // Everything else — scan for raw SQL patterns in string literals
+        return $this->extractTablesFromRawSql($code);
+    }
+
+    /**
+     * Parse PHP code into an AST and extract table references via visitor.
+     */
+    private function extractTablesFromPhp(string $code, string $filePath): array
+    {
+        try {
+            $ast = $this->parser->parse($code);
+        } catch (PhpParserError $e) {
+            // Parse failure — fall back to raw SQL scan
+            logger()->warning("MetadataExtractor: parse failed for {$filePath}: {$e->getMessage()}");
+            return $this->extractTablesFromRawSql($code);
+        }
+
+        if ($ast === null) {
+            return [];
+        }
+
+        $traverser = new NodeTraverser();
+        $visitor   = new TableReferenceVisitor();
+        $traverser->addVisitor($visitor);
+        $traverser->traverse($ast);
+
+        return $visitor->getTables();
+    }
+
+    /**
+     * Extract table names from raw SQL strings using regex.
+     * Used for .sql files and as a fallback for unparseable PHP.
+     */
+    private function extractTablesFromRawSql(string $code): array
+    {
+        $tables = [];
+
+        preg_match_all(
+            '/\b(?:FROM|JOIN|INTO|UPDATE)\s+[`"\']?(\w+)[`"\']?/i',
+            $code,
+            $matches
+        );
+
+        $tables = array_merge($tables, $matches[1]);
+
+        $ignore = [
+            'select', 'where', 'set', 'null', 'dual', 'table',
+            'row', 'result', 'data', 'query', 'values', 'index',
+            'information_schema', 'performance_schema', 'sys', 'mysql',
+        ];
+
+        $tables = array_unique($tables);
+        $tables = array_filter(
+            $tables,
+            fn($t) => !in_array(strtolower($t), $ignore) && strlen($t) > 2
+        );
+
+        return array_values($tables);
+    }
+
+    // =========================================================================
+    // Inference fallbacks
+    // These only fire when CodeChunker didn't already provide the value.
+    // =========================================================================
+
     private function inferClassName(string $code, string $filePath): ?string
     {
-        // Try to extract from PHP class definition
         if (preg_match('/class\s+(\w+)/', $code, $match)) {
             return $match[1];
         }
 
-        // Try to infer from filename
         $filename = pathinfo($filePath, PATHINFO_FILENAME);
 
-        // Check if it looks like a class name (PascalCase)
         if (preg_match('/^[A-Z][a-zA-Z0-9]+$/', $filename)) {
             return $filename;
         }
@@ -44,17 +150,12 @@ class MetadataExtractor
         return null;
     }
 
-    /**
-     * Infer method name from code if not already provided.
-     */
     private function inferMethodName(string $code): ?string
     {
-        // Try PHP method
         if (preg_match('/(?:public|protected|private)\s+(?:static\s+)?function\s+(\w+)/', $code, $match)) {
             return $match[1];
         }
 
-        // Try JS/TS function
         if (preg_match('/function\s+(\w+)/', $code, $match)) {
             return $match[1];
         }
@@ -62,79 +163,15 @@ class MetadataExtractor
         return null;
     }
 
-    /**
-     * Infer code type from file path.
-     */
     private function inferCodeType(string $filePath): string
     {
-        if (str_contains($filePath, 'routes/')) {
-            return 'route';
-        }
-
-        if (str_contains($filePath, 'migrations/')) {
-            return 'migration';
-        }
-
-        if (str_contains($filePath, 'config/')) {
-            return 'config';
-        }
-
-        if (str_contains($filePath, 'Controller')) {
-            return 'controller';
-        }
-
-        if (str_contains($filePath, 'Model') || str_contains($filePath, 'Models/')) {
-            return 'model';
-        }
-
-        if (str_contains($filePath, 'Service')) {
-            return 'service';
-        }
-
-        if (str_ends_with($filePath, '.sql')) {
-            return 'query';
-        }
-
+        if (str_contains($filePath, 'routes/'))                                    return 'route';
+        if (str_contains($filePath, 'migrations/'))                                return 'migration';
+        if (str_contains($filePath, 'config/'))                                    return 'config';
+        if (str_contains($filePath, 'Controller'))                                 return 'controller';
+        if (str_contains($filePath, 'Model') || str_contains($filePath, 'Models/')) return 'model';
+        if (str_contains($filePath, 'Service'))                                    return 'service';
+        if (str_ends_with($filePath, '.sql'))                                      return 'query';
         return 'file';
-    }
-
-    /**
-     * Extract database table references from code.
-     */
-    private function extractTableReferences(string $code): array
-    {
-        $tables = [];
-
-        // Laravel table references
-        // Schema::create('table_name', ...)
-        preg_match_all("/Schema::\w+\s*\(\s*['\"](\w+)['\"]/", $code, $schemaMatches);
-        $tables = array_merge($tables, $schemaMatches[1]);
-
-        // DB::table('table_name')
-        preg_match_all("/DB::table\s*\(\s*['\"](\w+)['\"]/", $code, $dbMatches);
-        $tables = array_merge($tables, $dbMatches[1]);
-
-        // Model::from('table_name') or ->from('table_name')
-        preg_match_all("/->from\s*\(\s*['\"](\w+)['\"]/", $code, $fromMatches);
-        $tables = array_merge($tables, $fromMatches[1]);
-
-        // $table->... in migrations (infer table from Schema::create context)
-        // protected $table = 'table_name' in models
-        preg_match_all("/protected\s+\\\$table\s*=\s*['\"](\w+)['\"]/", $code, $tableMatches);
-        $tables = array_merge($tables, $tableMatches[1]);
-
-        // SQL FROM/JOIN/INTO/UPDATE clauses
-        preg_match_all('/\b(?:FROM|JOIN|INTO|UPDATE)\s+[`"\']?(\w+)[`"\']?/i', $code, $sqlMatches);
-        $tables = array_merge($tables, $sqlMatches[1]);
-
-        // Remove duplicates and common false positives
-        $tables = array_unique($tables);
-        $tables = array_filter($tables, function ($table) {
-            // Filter out common false positives
-            $ignore = ['function', 'class', 'public', 'private', 'protected', 'static', 'return'];
-            return !in_array(strtolower($table), $ignore);
-        });
-
-        return array_values($tables);
     }
 }
