@@ -25,7 +25,9 @@ return new class extends Migration
         });
 
         // Add vector column using raw SQL (pgvector)
-        DB::statement('ALTER TABLE chunks ADD COLUMN embedding vector(768)');
+        // Using 1536 dimensions to support both Ollama (768) and OpenAI (1536)
+        // Ollama embeddings will be zero-padded to 1536 during storage
+        DB::statement('ALTER TABLE chunks ADD COLUMN embedding vector(1536)');
         
         // Create IVFFlat index for fast similarity search
         DB::statement('CREATE INDEX idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)');
